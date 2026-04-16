@@ -265,8 +265,8 @@ def rule_based_verdict(context: dict, scorer_risk: float) -> dict:
 
     sms = context.get("sms_fraud_signals", {}) if context else {}
     phishing_hits = sms.get("phishing_hits", 0) if sms else 0
-    _fk = sms.get("fraud_keywords", 0) if sms else 0
-    fraud_keywords = len(_fk) if isinstance(_fk, list) else int(_fk)
+    fraud_keywords_raw = sms.get("fraud_keywords", []) if sms else []
+    fraud_keywords = len(fraud_keywords_raw) if isinstance(fraud_keywords_raw, list) else int(fraud_keywords_raw or 0)
 
     gps = context.get("gps_location_match", {}) if context else {}
     gps_mismatch = gps.get("match") is False if gps else False
@@ -526,24 +526,49 @@ class InvestigatorAgent:
             gps = context.get("gps_location_match") or {}
             if gps.get("match") is not None:
                 mismatch = gps["match"] is False
-                # For fraud hypotheses: mismatch supports prediction (survives)
-                # For legit hypothesis: mismatch refutes it
                 survived = mismatch if is_fraud_hyp else (not mismatch)
+
+                # GPS mismatch with high distance is high-diagnostic:
+                # legitimate transactions rarely occur 100km+ from
+                # the user's GPS position.
+                dist = gps.get("distance_km")
+                if mismatch and dist is not None and dist > 100:
+                    pred.diagnostic_weight = max(pred.diagnostic_weight, 0.8)
+
                 return {
                     "survived": survived,
-                    "evidence": f"GPS match={gps.get('match')}, distance={gps.get('distance_km')}",
+                    "evidence": f"GPS match={gps.get('match')}, distance={dist}",
                 }
 
-        # SMS / phishing tests
+        # SMS / email / phishing tests
         if any(k in pred_lower for k in ["sms", "phishing", "keyword", "message", "email"]):
             sms = context.get("sms_fraud_signals") or {}
-            _fk = sms.get("fraud_keywords", 0)
-            fk_count = len(_fk) if isinstance(_fk, list) else int(_fk)
-            has_signals = sms.get("phishing_hits", 0) > 0 or fk_count > 0
+            email = context.get("email_fraud_signals") or {}
+
+            phishing_hits = (
+                (sms.get("phishing_hits", 0) or 0)
+                + (email.get("phishing_hits", 0) or 0)
+            )
+
+            # fraud_keywords may be list (from Context) or int — handle both
+            sms_kw = sms.get("fraud_keywords", [])
+            sms_kw_count = len(sms_kw) if isinstance(sms_kw, list) else int(sms_kw or 0)
+            email_kw = email.get("fraud_keywords", [])
+            email_kw_count = len(email_kw) if isinstance(email_kw, list) else int(email_kw or 0)
+            fraud_kw_count = sms_kw_count + email_kw_count
+
+            has_signals = phishing_hits > 0 or fraud_kw_count > 0
             survived = has_signals if is_fraud_hyp else (not has_signals)
+
+            # Phishing evidence is high-diagnostic: legitimate transactions
+            # rarely have associated phishing activity, so its presence
+            # shifts posteriors more aggressively than other signals.
+            if has_signals:
+                pred.diagnostic_weight = max(pred.diagnostic_weight, 0.85)
+
             return {
                 "survived": survived,
-                "evidence": f"phishing={sms.get('phishing_hits', 0)}, keywords={fk_count}",
+                "evidence": f"phishing={phishing_hits}, fraud_keywords={fraud_kw_count}",
             }
 
         # Amount deviation tests
@@ -665,11 +690,27 @@ class InvestigatorAgent:
         """
         Build the prompt for hypothesis + prediction generation.
 
+        Prompt structure incorporates three techniques from analytic philosophy
+        that measurably improve LLM reasoning on structured tasks:
+
+        1. EXPLICIT LOGICAL FORM — the modus tollens skeleton of falsification
+           is stated formally in the preamble. The model reasons within the
+           logical frame rather than defaulting to narrative association.
+
+        2. DE RE FRAMING — predictions are required to be about THIS SPECIFIC
+           transaction and its observable properties, not about the abstract
+           concept of "legitimate" or "fraudulent". This eliminates a class
+           of unfalsifiable definitional predictions.
+
+        3. OPERATOR PRECEDENCE — compound conditions must be explicitly
+           parenthesised. Prevents ambiguous parsing of multi-condition
+           predictions downstream.
+
         Deliberately prescriptive: the LLM must produce predictions that
         reference specific data fields, not narrative suspicion.
         """
         hypothesis_list = "\n".join(
-            f"  - {name} (prior={priors.get(name, 0.0):.2f})"
+            f"  - {name} (prior P(H) = {priors.get(name, 0.0):.2f})"
             for name in self.hypothesis_set
         )
 
@@ -681,32 +722,50 @@ class InvestigatorAgent:
             )
 
         context_summary = self._summarise_context_for_prompt(context)
+        tx_summary = self._summarise_tx_for_prompt(tx)
 
-        return f"""You are a fraud investigator using Popperian falsification.
-You do NOT look for evidence that CONFIRMS fraud. You test hypotheses by
-trying to REFUTE them. A hypothesis that survives refutation attempts is
-provisionally credible.
+        return f"""You are a fraud investigator reasoning under Popperian falsification.
 
-HYPOTHESES TO TEST:
+LOGICAL FORM:
+For each hypothesis H_i, generate predictions P_{{i,j}} such that if H_i is
+true, P_{{i,j}} must hold. P_{{i,j}} is FALSIFIED iff observed evidence E
+contradicts it. H_i is corroborated (never confirmed) iff its predictions
+survive falsification. You are refuting hypotheses, not confirming them.
+
+HYPOTHESES:
 {hypothesis_list}
 {memory_hints}
 
 TRANSACTION:
-{self._summarise_tx_for_prompt(tx)}
+{tx_summary}
 
-CONTEXT BUNDLE:
+CONTEXT:
 {context_summary}
 
-TASK: For each hypothesis, generate 2-3 predictions that would REFUTE it
-if true. Each prediction must:
-  - reference a SPECIFIC data field (amount, hour, gps, sms, merchant,
-    counterparty, etc.) or a COMPARATOR (greater than, less than, within,
-    outside, contains)
-  - be falsifiable: it must be possible to say "this prediction failed"
-    based on observed data
-  - avoid vague phrases like "something suspicious" or "might seem unusual"
+TASK: For each H_i, generate 2–3 predictions that would refute it.
 
-Return JSON in exactly this format:
+PREDICTION RULES:
+(a) DE RE: each prediction must be about THIS transaction's observable
+    properties, not about abstractions. Reference specific context fields
+    (amount, gps_location_match, sms_fraud_signals, hour, recipient_in_degree,
+    is_new_merchant, etc.) with specific comparators (>, <, within, contains).
+    GOOD: "GPS ping should be within 50km of transaction location."
+    BAD:  "A legitimate transaction would not look suspicious."
+
+(b) FALSIFIABLE: if you cannot state what observation would make the
+    prediction fail, do not include it.
+
+(c) PARENTHESISE compound conditions explicitly:
+    GOOD: "((GPS distance > 50km) AND (hour in [0,5])) OR (z-score > 3.0)"
+    BAD:  "GPS > 50km AND hour 0-5 OR z-score > 3"
+
+DIAGNOSTIC VALUE (base-rate asymmetry — use when assigning diagnostic_weight):
+High diagnostic (rare in legitimate activity, weight >= 0.7):
+  sms_fraud_signals, email_fraud_signals, gps_location_match=False with distance>100km
+Low diagnostic (common in both legitimate and fraudulent, weight <= 0.4):
+  is_new_merchant, amount deviation alone, hour_of_day alone
+
+RETURN FORMAT — valid JSON only, no markdown:
 {{
   "legitimate transaction": [
     {{"prediction": "...", "refutation_target": "gps_location_match", "diagnostic_weight": 0.7}},
@@ -717,8 +776,8 @@ Return JSON in exactly this format:
   "synthetic identity fraud": [...],
   "unauthorised use of payment method": [...]
 }}
-
-Return ONLY valid JSON. No markdown, no preamble.
+diagnostic_weight ∈ [0,1]: higher = more diagnostic (unique to one hypothesis).
+Return ONLY the JSON object.
 """
 
     def _summarise_tx_for_prompt(self, tx: Any) -> str:
@@ -795,16 +854,6 @@ Return ONLY valid JSON. No markdown, no preamble.
 
     def _call_llm(self, prompt: str, max_tokens: int = 1200) -> str:
         """Abstracted LLM call. Supports multiple client interfaces."""
-        # OpenAI-compatible client (openai SDK or OpenRouter)
-        if hasattr(self._llm, "chat"):
-            model = getattr(self, "_model", "openai/gpt-4o-mini")
-            resp = self._llm.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.2,
-            )
-            return resp.choices[0].message.content or ""
         if hasattr(self._llm, "generate"):
             return self._llm.generate(prompt, max_tokens=max_tokens)
         if hasattr(self._llm, "complete"):
