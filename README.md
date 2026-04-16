@@ -30,7 +30,7 @@ flowchart TD
 
     SCO["**Scorer agent**\nIsolationForest + drift features"]:::green
     CTX["**Context agent**\nMemory-enriched evidence"]:::green
-    INV["**Investigator agent**\nHaiku or Sonnet"]:::brown
+    INV["**Investigator agent**\nGPT-4o"]:::brown
 
     INV --> CRI["**Critic agent**\nChallenges the verdict"]:::maroon
 
