@@ -196,8 +196,8 @@ ulid-py
 
 | Role | Components |
 |------|-----------|
-| Role A | Orchestrator, Decision Fusion, CostTracker, Validator |
-| Role B | Scorer, Context |
-| Role C | Investigator, Memory, Critic, STT |
+| Yunbeom Choe| Orchestrator, Decision Fusion, CostTracker, Validator |
+| Katalin Pazmany | Scorer, Context |
+| Alex Yeung | Investigator, Memory, Critic, STT |
 
 Interface signatures are a team contract — flag any changes to all roles before committing.
