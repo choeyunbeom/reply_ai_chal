@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Data files (large; share via other means)
+data/level_*/train.csv
+data/level_*/eval.csv
+
+# Submissions are committed intentionally — do not ignore
+# submissions/
+
+# Model artifacts
+*.pkl
+*.joblib
+*.lgb
