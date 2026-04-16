@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from langfuse.types import TraceContext; print\\(TraceContext.__annotations__ if hasattr\\(TraceContext, '__annotations__'\\) else 'no annotations'\\); tc = TraceContext\\(trace_id='abc', session_id='sess-xyz'\\); print\\(tc\\)\")"
+    ]
+  }
+}

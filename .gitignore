@@ -16,3 +16,4 @@ data/level_*/eval.csv
 *.pkl
 *.joblib
 *.lgb
+/data

@@ -295,27 +295,9 @@ class OrchestratorAgent:
 
         scores: np.ndarray = self.scorer.predict(enriched_df)
 
-        # Context-aware score boost: if context_agent has phishing signals for a tx,
-        # bump score into gray zone so LLM investigator handles it.
-        # This compensates for heuristic scorer being blind to SMS/email signals.
-        boosted_scores = scores.copy()
-        if hasattr(self.context_agent, "build"):
-            for idx, (_, row) in enumerate(eval_df.iterrows()):
-                try:
-                    ctx_quick = self.context_agent.build(str(row[tx_id_col]))
-                    sms = ctx_quick.get("sms_fraud_signals", {})
-                    phishing_hits = sms.get("phishing_hits", 0) or 0
-                    _fk = sms.get("fraud_keywords", 0)
-                    fraud_kw = len(_fk) if isinstance(_fk, list) else int(_fk)
-                    if phishing_hits > 0 or fraud_kw >= 2:
-                        # Push into gray zone minimum
-                        boosted_scores[idx] = max(
-                            boosted_scores[idx],
-                            self.fusion.gray_low + 0.01,
-                        )
-                except Exception:
-                    pass
-        scores = boosted_scores
+        # Isolation Forest already captures anomalous transactions.
+        # Phishing/SMS signals are passed to the investigator via context bundle
+        # and handled there — no score boosting needed at the orchestrator level.
 
         fraud_ids: list[str] = []
 

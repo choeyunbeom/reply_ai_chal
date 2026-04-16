@@ -47,6 +47,7 @@ LEVEL_CONFIG: dict[int, dict] = {
         "throttle_at": 0.90,
         "train_folder": "Deus Ex - train",
         "eval_folder": "Deus Ex - validation",
+        "audio_folder": "audio",  # mp3 call recordings — Role C handles STT
     },
     4: {
         "budget": 55.0,

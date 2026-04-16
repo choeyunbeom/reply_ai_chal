@@ -6,22 +6,27 @@ Role B — Scorer Agent.
 Team contract (do not change signature without flagging Role A + B):
     scorer.predict(tx_df) -> np.ndarray   # float32, shape (N,), in [0, 1]
 
+Model: Isolation Forest (unsupervised anomaly detection).
+Rationale: training data has no fraud labels, so supervised learning is
+impossible. IsolationForest scores each transaction by how "isolated"
+(anomalous) it is in feature space — no labels needed.
+
 Key design decisions:
-  - predict() accepts BOTH a DataFrame and a single pd.Series (Orchestrator
-    passes one row at a time in the routing loop)
-  - Heuristic mode works WITHOUT training labels but is intentionally conservative:
-    most legitimate transactions score below 0.3. Fraud signals in validation
-    data (new merchants, night-time, location mismatch, high z-score) will push
-    scores up into the gray zone. This is correct behaviour — do not "fix" it.
-  - fit() MUST be called at the start of each level with that level's training
-    data before scoring the eval set. Retraining per level is mandatory per
-    CLAUDE.md. Never reuse a model from a prior level.
-  - Memory Agent signals injected via update_memory_features() before predict()
+  - fit() trains on the full training set without labels
+  - predict() converts IF's raw anomaly score to [0, 1]:
+      negate (IF: low = anomalous) → scale using training bounds → clip
+  - Score conversion uses training-data bounds so extreme eval anomalies
+    correctly saturate at 1.0 rather than breaking the [0, 1] contract
+  - predict() accepts BOTH DataFrame and pd.Series (Orchestrator passes rows
+    as Series in the routing loop)
+  - All features have safe fallbacks — missing columns never crash predict()
+  - Unseen users, transaction types, payment methods all handled gracefully
 
 Per CLAUDE.md:
   - logging not print
   - pathlib.Path for all file access
-  - Time-based train/val split (caller's responsibility — scorer never splits)
+  - Retrain at each level start — never reuse a prior model
+  - Time-based train/val split is caller's responsibility
 """
 
 import json
@@ -32,16 +37,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logger = logging.getLogger(__name__)
-
-try:
-    import lightgbm as lgb
-    HAS_LGB = True
-except ImportError:
-    HAS_LGB = False
-    logger.warning("lightgbm not installed — heuristic fallback active.")
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +59,7 @@ PAYMENT_METHOD_RISK: dict[str, float] = {
     "credit card": 0.45,
     "crypto": 0.85,
 }
-PAYMENT_METHOD_DEFAULT = 0.30   # unseen methods — moderate, never zero
+PAYMENT_METHOD_DEFAULT = 0.30
 
 TX_TYPE_RISK: dict[str, float] = {
     "direct debit": 0.05,
@@ -71,29 +70,27 @@ TX_TYPE_RISK: dict[str, float] = {
     "international transfer": 0.75,
     "crypto": 0.90,
 }
-TX_TYPE_DEFAULT = 0.35           # unseen types — moderate
+TX_TYPE_DEFAULT = 0.35
 
-# City hints from user ID suffix (e.g. BRCH-TRCY-802-HAM-1 → Hampstead)
 ID_CITY_HINTS: dict[str, str] = {
     "HAM": "Hampstead",
     "DIE": "Dietzenbach",
     "AUD": "Audincourt",
 }
 
-FEATURE_COLS = [
+# Features fed to Isolation Forest — all numeric, no NaN allowed
+IF_FEATURE_COLS = [
+    "amount",
+    "hour_of_day",
+    "balance_after",
     "amount_zscore",
     "amount_vs_user_max",
     "balance_ratio",
     "is_night",
-    "hour_of_day",
-    "day_of_week",
-    "location_match",
-    "user_tx_frequency_30d",
-    "is_new_merchant",
     "tx_type_risk",
     "payment_method_risk",
+    "is_new_merchant",
     "days_since_last_tx",
-    "amount_round_number",
     "is_known_fraud_merchant",
 ]
 
@@ -178,10 +175,7 @@ def build_home_cities(df: pd.DataFrame, users: list[dict]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _coerce_to_dataframe(tx) -> pd.DataFrame:
-    """
-    Accept either a DataFrame or a single pd.Series (one transaction row).
-    The Orchestrator routing loop passes rows as Series — we handle both.
-    """
+    """Accept DataFrame or pd.Series — Orchestrator passes rows as Series."""
     if isinstance(tx, pd.Series):
         return tx.to_frame().T.reset_index(drop=True)
     return tx.copy()
@@ -205,22 +199,22 @@ def engineer_features(
     home_cities: dict[str, str],
 ) -> pd.DataFrame:
     """
-    Build features from raw transactions. Every feature has an explicit fallback.
-
-    Note on heuristic calibration:
-      Legitimate transactions (rent, salary, subscriptions) naturally score low.
-      Fraud signals — new merchants, night-time, location mismatch, amount spike,
-      known fraud merchant — will push scores into the gray zone on eval data.
-      Do not tune heuristic weights to artificially inflate training scores.
+    Build the numeric feature matrix for Isolation Forest.
+    Every feature has an explicit safe fallback — no NaN reaches the model.
     """
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False)
     out = pd.DataFrame(index=df.index)
 
+    # Raw values (IF uses these directly as anomaly signals)
+    out["amount"] = df["amount"].fillna(0.0)
+    out["balance_after"] = df["balance_after"].fillna(0.0)
+
+    # Temporal
     out["hour_of_day"] = df["timestamp"].dt.hour.astype(float)
     out["is_night"] = out["hour_of_day"].between(0, 5).astype(float)
-    out["day_of_week"] = df["timestamp"].dt.dayofweek.astype(float)
 
+    # Amount vs this user's own history
     def _z(row):
         s = stats.get(str(row["sender_id"]))
         return (row["amount"] - s["mean"]) / (s["std"] + 1e-9)
@@ -235,24 +229,12 @@ def engineer_features(
         df["amount"] / (df["balance_after"].replace(0, np.nan) + df["amount"])
     ).fillna(0.5).clip(0, 1)
 
-    def _loc(row):
-        loc = row.get("location")
-        if pd.isna(loc) or loc == "":
-            return 0.5   # neutral: no location (transfer/debit)
-        home = home_cities.get(str(row["sender_id"]), "")
-        if not home:
-            return 0.5   # unknown user: neutral
-        return 1.0 if home.lower() in str(loc).lower() else 0.0
-
-    out["location_match"] = df.apply(_loc, axis=1)
-
-    out["user_tx_frequency_30d"] = df.apply(
-        lambda r: float(stats.recent_count(str(r["sender_id"]), r["timestamp"])), axis=1
-    )
+    # Activity
     out["days_since_last_tx"] = df.apply(
         lambda r: stats.days_since_last(str(r["sender_id"]), r["timestamp"]), axis=1
     )
 
+    # New merchant flag
     def _new_merchant(row):
         loc = row.get("location")
         if pd.isna(loc) or loc == "":
@@ -260,6 +242,8 @@ def engineer_features(
         return 0.0 if loc in stats.get(str(row["sender_id"]))["merchants"] else 1.0
 
     out["is_new_merchant"] = df.apply(_new_merchant, axis=1)
+
+    # Risk encodings for categorical fields
     out["tx_type_risk"] = df["transaction_type"].apply(
         lambda x: TX_TYPE_RISK.get(str(x).lower().strip(), TX_TYPE_DEFAULT)
     )
@@ -267,40 +251,53 @@ def engineer_features(
         lambda x: 0.0 if (pd.isna(x) or x == "")
                   else PAYMENT_METHOD_RISK.get(str(x).lower().strip(), PAYMENT_METHOD_DEFAULT)
     )
-    out["amount_round_number"] = (df["amount"] % 50 == 0).astype(float)
+
+    # Memory Agent feature
     out["is_known_fraud_merchant"] = df.get("is_known_fraud_merchant", 0.0).fillna(0.0)
 
-    return out[FEATURE_COLS]
+    # Final safety net: fill any remaining NaN with 0
+    return out[IF_FEATURE_COLS].fillna(0.0)
 
 
 # ---------------------------------------------------------------------------
-# Heuristic scorer
+# Score conversion: IF raw → [0, 1] fraud score
 # ---------------------------------------------------------------------------
 
-def _heuristic_score(row: pd.Series) -> float:
+def _if_to_fraud_score(
+    raw_scores: np.ndarray,
+    train_score_min: float,
+    train_score_max: float,
+) -> np.ndarray:
     """
-    Interpretable fallback when LightGBM is unavailable or untrained.
+    Convert Isolation Forest score_samples() output to a [0, 1] fraud score.
 
-    Calibration intent:
-      - Normal transactions (salary, rent, subscriptions): score 0.05–0.25
-      - Mildly suspicious (new merchant, unusual hour): 0.25–0.45
-      - Clearly suspicious (GPS mismatch + night + new merchant): 0.45–0.70+
-      - Known fraud merchant: hard push toward fraud threshold
+    IF convention:  more negative  = more anomalous = more likely fraud
+    Our convention: higher value   = more anomalous = more likely fraud
 
-    The low baseline on training data is correct — training data is clean.
+    Uses training-data bounds for scaling so eval anomalies more extreme than
+    anything seen in training correctly saturate at 1.0.
     """
+    neg = -raw_scores
+    neg_min = -train_score_max
+    neg_max = -train_score_min
+    scaled = (neg - neg_min) / (neg_max - neg_min + 1e-9)
+    return np.clip(scaled, 0.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic fallback (only used if fit() was never called)
+# ---------------------------------------------------------------------------
+
+def _heuristic_fallback(row: pd.Series) -> float:
     s = 0.0
     s += 0.20 * float(np.clip(row["amount_zscore"] / 5.0, 0, 1))
     s += 0.15 * row["is_night"]
     s += 0.12 * row["is_new_merchant"]
     s += 0.12 * row["payment_method_risk"]
-    s += 0.10 * (1.0 - row["location_match"])
     s += 0.08 * row["tx_type_risk"]
     s += 0.07 * float(np.clip(row["amount_vs_user_max"], 0, 1))
     s += 0.07 * row["balance_ratio"]
     s += 0.05 * row["is_known_fraud_merchant"]
-    s += 0.03 * row["amount_round_number"]
-    s += 0.01 * (1.0 - float(np.clip(row["user_tx_frequency_30d"] / 10.0, 0, 1)))
     return float(np.clip(s, 0.0, 1.0))
 
 
@@ -313,20 +310,21 @@ class ScorerAgent:
     Role B — Scorer Agent.
 
     Team contract:
-        scorer.predict(tx_df) -> np.ndarray   # shape (N,), float32, in [0, 1]
+        scorer.predict(tx) -> np.ndarray   # shape (N,), float32, in [0, 1]
 
-    predict() accepts either a DataFrame or a single pd.Series — both are safe.
-    The Orchestrator routing loop passes individual rows as Series.
+    Uses Isolation Forest (unsupervised) — no fraud labels needed.
+    fit() trains on the full training set. predict() scores by anomaly.
 
     Per-level workflow:
         scorer = ScorerAgent(users_path=...)
-        scorer.fit(level_train_df)                           # retrain every level
-        tx_df = scorer.update_memory_features(eval_df, memory.query(tx))
-        scores = scorer.predict(tx_df)                       # or predict(tx_row)
+        scorer.fit(level_train_df)           # retrain every level, no labels needed
+        scores = scorer.predict(eval_df)     # or predict(single_row_as_Series)
     """
 
     def __init__(self, users_path: str | Path = "data/users.json") -> None:
-        self.model: "lgb.LGBMClassifier | None" = None
+        self.model: IsolationForest | None = None
+        self._train_score_min: float = -1.0
+        self._train_score_max: float = -0.3
         self._stats = UserStats()
         self._home_cities: dict[str, str] = {}
         self._users: list[dict] = []
@@ -337,48 +335,47 @@ class ScorerAgent:
                 self._users = json.load(f)
             logger.info("ScorerAgent: loaded %d users from %s", len(self._users), p)
         else:
-            logger.warning("ScorerAgent: users_path not found (%s) — home city mapping disabled.", p)
-
-    def fit(self, train_df: pd.DataFrame, label_col: str = "is_fraud") -> None:
-        """
-        Train LightGBM. Must be called at the start of each level.
-        Caller is responsible for time-based train/val split (last 20% held out).
-        Never call fit() with random splits — hides drift effects.
-        """
-        if label_col not in train_df.columns:
-            raise ValueError(
-                f"Column '{label_col}' not in train_df. "
-                "Provide fraud labels before calling fit()."
+            logger.warning(
+                "ScorerAgent: users_path not found (%s) — home city mapping disabled.", p
             )
+
+    def fit(self, train_df: pd.DataFrame, label_col: str | None = None) -> None:
+        """
+        Train Isolation Forest on the full training set.
+        No fraud labels required — label_col accepted but ignored.
+        Must be called at the start of each level. Never reuse across levels.
+        """
         df = _ensure_columns(_coerce_to_dataframe(train_df))
         self._stats.build(df)
         self._home_cities = build_home_cities(df, self._users)
 
-        X = engineer_features(df, self._stats, self._home_cities)
-        y = df[label_col].astype(int)
+        X = engineer_features(df, self._stats, self._home_cities).values
 
-        if not HAS_LGB:
-            logger.warning("ScorerAgent: LightGBM unavailable — heuristic fallback.")
-            return
-
-        fraud_rate = max(float(y.mean()), 1e-3)
-        self.model = lgb.LGBMClassifier(
-            objective="binary", metric="auc",
-            learning_rate=0.05, num_leaves=31, min_child_samples=5,
-            feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-            scale_pos_weight=(1.0 - fraud_rate) / fraud_rate,
-            verbose=-1, n_estimators=300,
+        self.model = IsolationForest(
+            n_estimators=200,
+            contamination="auto",   # unknown fraud rate → let IF decide
+            max_features=1.0,
+            bootstrap=False,
+            random_state=42,
+            n_jobs=-1,
         )
-        self.model.fit(X, y, eval_set=[(X, y)],
-                       callbacks=[lgb.early_stopping(30, verbose=False)])
+        self.model.fit(X)
+
+        # Store training score bounds for consistent conversion at predict time
+        train_scores = self.model.score_samples(X)
+        self._train_score_min = float(train_scores.min())
+        self._train_score_max = float(train_scores.max())
+
         logger.info(
-            "ScorerAgent: trained — %d samples, %d fraud (%.1f%%)",
-            len(X), int(y.sum()), fraud_rate * 100,
+            "ScorerAgent: IsolationForest trained — %d samples, %d features, "
+            "score range [%.4f, %.4f]",
+            len(X), X.shape[1],
+            self._train_score_min, self._train_score_max,
         )
 
     def predict(self, tx) -> np.ndarray:
         """
-        Score transactions.
+        Score transactions by anomaly — higher = more anomalous = more likely fraud.
 
         Parameters
         ----------
@@ -400,25 +397,23 @@ class ScorerAgent:
 
         feats = engineer_features(df, self._stats, self._home_cities)
 
-        if self.model is not None and HAS_LGB:
-            return self.model.predict_proba(feats)[:, 1].astype(np.float32)
-        return feats.apply(_heuristic_score, axis=1).values.astype(np.float32)
+        if self.model is not None:
+            raw = self.model.score_samples(feats.values)
+            return _if_to_fraud_score(raw, self._train_score_min, self._train_score_max)
 
-    def update_memory_features(
-        self,
-        tx,
-        memory_patterns: dict,
-    ) -> pd.DataFrame:
+        logger.warning("ScorerAgent: no model fitted — using heuristic fallback.")
+        return feats.apply(_heuristic_fallback, axis=1).values.astype(np.float32)
+
+    def update_memory_features(self, tx, memory_patterns: dict) -> pd.DataFrame:
         """
         Inject Memory Agent signals before calling predict().
 
         Parameters
         ----------
         tx : pd.DataFrame or pd.Series
-            Transactions to augment.
         memory_patterns : dict
-            Return value of memory.query(tx). Reads key:
-              "known_fraud_merchants": set[str]
+            Return value of memory.query(tx).
+            Reads key: "known_fraud_merchants": set[str]
 
         Returns
         -------
@@ -440,8 +435,12 @@ class ScorerAgent:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump({
-                "model": self.model, "stats": self._stats,
-                "home_cities": self._home_cities, "users": self._users,
+                "model": self.model,
+                "train_score_min": self._train_score_min,
+                "train_score_max": self._train_score_max,
+                "stats": self._stats,
+                "home_cities": self._home_cities,
+                "users": self._users,
             }, f)
         logger.info("ScorerAgent: saved → %s", path)
 
@@ -449,14 +448,13 @@ class ScorerAgent:
         with open(Path(path), "rb") as f:
             p = pickle.load(f)
         self.model = p["model"]
+        self._train_score_min = p["train_score_min"]
+        self._train_score_max = p["train_score_max"]
         self._stats = p["stats"]
         self._home_cities = p["home_cities"]
         self._users = p.get("users", [])
         logger.info("ScorerAgent: loaded ← %s", path)
 
-    def feature_importance(self) -> "pd.Series | None":
-        if self.model is not None and HAS_LGB:
-            return pd.Series(
-                self.model.feature_importances_, index=FEATURE_COLS
-            ).sort_values(ascending=False)
+    def feature_importance(self) -> None:
+        """Isolation Forest has no feature importances — returns None."""
         return None

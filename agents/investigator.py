@@ -853,7 +853,27 @@ Return ONLY the JSON object.
         return "\n".join(parts) if parts else "  (empty bundle)"
 
     def _call_llm(self, prompt: str, max_tokens: int = 1200) -> str:
-        """Abstracted LLM call. Supports multiple client interfaces."""
+        """Abstracted LLM call. Supports LangChain ChatOpenAI and generic interfaces."""
+        # LangChain ChatOpenAI (official challenge tutorial method)
+        if hasattr(self._llm, "invoke"):
+            from langchain_core.messages import HumanMessage
+            config = {}
+            if hasattr(self._llm, "_langfuse_handler") and hasattr(self._llm, "_langfuse_session_id"):
+                config = {
+                    "callbacks": [self._llm._langfuse_handler],
+                    "metadata": {"langfuse_session_id": self._llm._langfuse_session_id},
+                }
+            response = self._llm.invoke([HumanMessage(content=prompt)], config=config)
+            return response.content or ""
+        # OpenAI-compatible client fallback
+        if hasattr(self._llm, "chat"):
+            response = self._llm.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.2,
+            )
+            return response.choices[0].message.content or ""
         if hasattr(self._llm, "generate"):
             return self._llm.generate(prompt, max_tokens=max_tokens)
         if hasattr(self._llm, "complete"):

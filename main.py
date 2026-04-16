@@ -96,18 +96,36 @@ def main() -> None:
     level_dir = DATA_DIR / f"level_{level}"
     train_dir = level_dir / cfg["train_folder"]
 
-    # Langfuse tracing via environment variables (auto-picked up by SDK)
-    os.environ.setdefault("LANGFUSE_PUBLIC_KEY", os.environ["LANGFUSE_PUBLIC_KEY"])
-    os.environ.setdefault("LANGFUSE_SECRET_KEY", os.environ["LANGFUSE_SECRET_KEY"])
-    os.environ.setdefault("LANGFUSE_HOST", os.environ["LANGFUSE_HOST"])
     logger.info("langfuse | tracing enabled → %s", os.environ["LANGFUSE_HOST"])
 
-    # LLM client via OpenRouter (Langfuse traces via env vars automatically)
-    from langfuse.openai import OpenAI as LangfuseOpenAI
-    llm_client = LangfuseOpenAI(
+    # LLM client + Langfuse tracing — official challenge tutorial method
+    import ulid as _ulid
+    from langfuse import Langfuse
+    from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
+    from langchain_openai import ChatOpenAI
+
+    team_name = os.environ.get("TEAM_NAME", "reply-mirror")
+    session_id = f"{team_name}-{_ulid.new().str}"
+    logger.info("langfuse | session_id=%s", session_id)
+    print(f"\n{'='*60}\nLANGFUSE SESSION ID: {session_id}\n{'='*60}\n")
+
+    _langfuse = Langfuse(
+        public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
+        secret_key=os.environ["LANGFUSE_SECRET_KEY"],
+        host=os.environ["LANGFUSE_HOST"],
+    )
+    _langfuse_handler = LangfuseCallbackHandler()
+
+    llm_client = ChatOpenAI(
         api_key=os.environ["OPENROUTER_API_KEY"],
         base_url="https://openrouter.ai/api/v1",
+        model=cfg["llm_model"],
+        temperature=0.2,
+        max_tokens=1200,
     )
+    # Attach langfuse handler + session_id so investigator can tag LLM calls
+    llm_client._langfuse_handler = _langfuse_handler
+    llm_client._langfuse_session_id = session_id
 
     memory = MemoryAgent()
     scorer = ScorerAgent(users_path=train_dir / "users.json")
@@ -134,20 +152,21 @@ def main() -> None:
     if args.train:
         logger.warning("--train ignored: no is_fraud labels in dataset, using heuristic scorer")
 
-    # Build user stats from train data so heuristic scorer has baselines
-    logger.info("scorer | building user stats from train data (%d rows)", len(train_df))
-    scorer._stats.build(train_df)
-    import json
-    with open(train_dir / "users.json") as f:
-        _users = json.load(f)
-    from agents.scorer import build_home_cities
-    scorer._home_cities = build_home_cities(train_df, _users)
+    # Fit Isolation Forest on training data (no labels needed)
+    logger.info("scorer | fitting IsolationForest on train data (%d rows)", len(train_df))
+    scorer.fit(train_df)
 
     # Step 4: cache training baseline for drift detection, load hypotheses
     memory.cache_training_baseline(train_df)
     if level >= 2:
         memory.refresh_hypotheses(level)
     logger.info("memory | baseline cached, hypotheses=%d", len(memory.hypotheses()))
+
+    # Level 3+: audio call recordings available for Role C (STT-based evidence)
+    if cfg.get("audio_folder"):
+        train_audio = train_dir / cfg["audio_folder"]
+        logger.info("audio | train recordings: %s (%d files)", train_audio,
+                    len(list(train_audio.glob("*.mp3"))) if train_audio.exists() else 0)
 
     # Reload context_agent with eval data so build(tx_id) works on eval set
     eval_dir = level_dir / cfg["eval_folder"]
@@ -159,8 +178,23 @@ def main() -> None:
     )
     logger.info("context | reloaded with eval data")
 
+    # Rebuild user stats from eval data — eval users are different from train users.
+    # IF model stays train-fitted; only the per-user baselines (mean/std/max) update
+    # so that amount_zscore/amount_vs_user_max are computed against each eval user's
+    # own history rather than cold-start defaults.
+    logger.info("scorer | rebuilding user stats from eval data (%d rows)", len(eval_df))
+    scorer._stats.build(eval_df)
+    import json as _json
+    eval_users_path = eval_dir / "users.json"
+    if eval_users_path.exists():
+        with open(eval_users_path) as _f:
+            _eval_users = _json.load(_f)
+        from agents.scorer import build_home_cities as _bhc
+        scorer._home_cities = _bhc(eval_df, _eval_users)
+
     # Run pipeline on eval set
     fraud_ids = orchestrator.run(eval_df)
+    _langfuse.flush()
     logger.info("Pipeline complete — %d fraud IDs flagged", len(fraud_ids))
 
     # Step 9: record internal validation score for next level
