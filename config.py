@@ -40,7 +40,7 @@ LEVEL_CONFIG: dict[int, dict] = {
     },
     3: {
         "budget": 15.0,
-        "gray_low": 0.25,
+        "gray_low": 0.50,
         "gray_high": 0.75,
         "llm_model": "gpt-4o-mini",
         "critic": False,

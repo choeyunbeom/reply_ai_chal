@@ -28,6 +28,7 @@ from agents.scorer import ScorerAgent
 from agents.context import ContextAgent
 from agents.investigator import InvestigatorAgent
 from agents.critic import CriticAgent
+from agents.stt import STTAgent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,13 +100,13 @@ def main() -> None:
     logger.info("langfuse | tracing enabled → %s", os.environ["LANGFUSE_HOST"])
 
     # LLM client + Langfuse tracing — official challenge tutorial method
-    import ulid as _ulid
+    from ulid import ULID as _ULID
     from langfuse import Langfuse
     from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
     from langchain_openai import ChatOpenAI
 
     team_name = os.environ.get("TEAM_NAME", "reply-mirror")
-    session_id = f"{team_name}-{_ulid.new().str}"
+    session_id = f"{team_name}-{str(_ULID())}"
     logger.info("langfuse | session_id=%s", session_id)
     print(f"\n{'='*60}\nLANGFUSE SESSION ID: {session_id}\n{'='*60}\n")
 
@@ -127,13 +128,21 @@ def main() -> None:
     llm_client._langfuse_handler = _langfuse_handler
     llm_client._langfuse_session_id = session_id
 
-    memory = MemoryAgent()
+    memory_path = DATA_DIR / f"memory_level_{level - 1}.pkl"
+    if level > 1 and memory_path.exists():
+        memory = MemoryAgent.load(str(memory_path), llm_client=llm_client)
+        logger.info("memory | loaded cross-level state from %s", memory_path)
+    else:
+        memory = MemoryAgent()
+        logger.info("memory | fresh start (level 1 or no prior state)")
+
     scorer = ScorerAgent(users_path=train_dir / "users.json")
     context_agent = ContextAgent(
         transactions_path=train_dir / "transactions.csv",
         users_path=train_dir / "users.json",
         locations_path=train_dir / "locations.json",
         sms_path=train_dir / "sms.json",
+        email_path=train_dir / "mails.json",
     )
     investigator = InvestigatorAgent(llm_client=llm_client)
     investigator._model = cfg["llm_model"]
@@ -146,6 +155,7 @@ def main() -> None:
         investigator=investigator,
         critic=critic,
         memory=memory,
+        stt_agent=None,  # set after STT transcription below
     )
 
     # --train disabled: dataset has no fraud labels, heuristic scorer used instead
@@ -162,12 +172,6 @@ def main() -> None:
         memory.refresh_hypotheses(level)
     logger.info("memory | baseline cached, hypotheses=%d", len(memory.hypotheses()))
 
-    # Level 3+: audio call recordings available for Role C (STT-based evidence)
-    if cfg.get("audio_folder"):
-        train_audio = train_dir / cfg["audio_folder"]
-        logger.info("audio | train recordings: %s (%d files)", train_audio,
-                    len(list(train_audio.glob("*.mp3"))) if train_audio.exists() else 0)
-
     # Reload context_agent with eval data so build(tx_id) works on eval set
     eval_dir = level_dir / cfg["eval_folder"]
     context_agent.reload(
@@ -175,8 +179,30 @@ def main() -> None:
         users_path=eval_dir / "users.json" if (eval_dir / "users.json").exists() else None,
         locations_path=eval_dir / "locations.json" if (eval_dir / "locations.json").exists() else None,
         sms_path=eval_dir / "sms.json" if (eval_dir / "sms.json").exists() else None,
+        email_path=eval_dir / "mails.json" if (eval_dir / "mails.json").exists() else None,
     )
     logger.info("context | reloaded with eval data")
+
+    # Level 3+: STT — transcribe eval audio and wire to orchestrator
+    # STT routes through Context (audio_fraud_signals added to bundle).
+    # Role B: add optional stt_agent param to ContextAgent.build() so Context
+    # populates the field natively. Until then, Orchestrator enriches post-build.
+    # Role C: Investigator should check audio_fraud_signals in _test_against_context
+    # and _summarise_context_for_prompt (same handling as sms_fraud_signals).
+    stt_agent = None
+    if cfg.get("audio_folder"):
+        eval_audio = eval_dir / cfg["audio_folder"]
+        import json as _json_stt
+        _stt_users: list[dict] = []
+        _eval_users_path = eval_dir / "users.json"
+        if _eval_users_path.exists():
+            with open(_eval_users_path) as _f:
+                _stt_users = _json_stt.load(_f)
+        _sender_ids = eval_df["sender_id"].astype(str).unique().tolist()
+        stt_agent = STTAgent(model_size="tiny", users=_stt_users, sender_ids=_sender_ids)
+        n_transcribed = stt_agent.transcribe_all(eval_audio)
+        logger.info("stt | transcribed %d eval audio files", n_transcribed)
+        orchestrator.stt_agent = stt_agent
 
     # Rebuild user stats from eval data — eval users are different from train users.
     # IF model stays train-fitted; only the per-user baselines (mean/std/max) update
@@ -196,6 +222,11 @@ def main() -> None:
     fraud_ids = orchestrator.run(eval_df)
     _langfuse.flush()
     logger.info("Pipeline complete — %d fraud IDs flagged", len(fraud_ids))
+
+    # Save memory state for next level (fraud merchants, graph, hypotheses)
+    memory_save_path = DATA_DIR / f"memory_level_{level}.pkl"
+    memory.save(str(memory_save_path))
+    logger.info("memory | saved to %s", memory_save_path)
 
     # Step 9: record internal validation score for next level
     # Role B should pass val_score after evaluating on val_split

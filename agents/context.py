@@ -62,6 +62,16 @@ FRAUD_KEYWORDS = [
     "urgent", "immediately", "act now",
 ]
 
+EMAIL_FRAUD_KEYWORDS = [
+    "wire transfer", "wiring instructions", "change of bank details",
+    "updated payment information", "new account number",
+    "invoice attached", "overdue invoice", "past due",
+    "please remit", "remittance",
+    "confidential", "do not discuss",
+    "urgent request from", "gift card", "itunes card",
+    "tax refund", "hmrc", "irs",
+]
+
 SALARY_BANDS = [
     (0,        20_000,       "low"),
     (20_000,   40_000,       "lower-middle"),
@@ -202,6 +212,44 @@ def _sms_fraud_signals(
     }
 
 
+def _email_fraud_signals(
+    email_addr: str | None,
+    first_name: str,
+    email_data: list[dict],
+) -> dict:
+    phishing_hits = 0
+    suspicious_domains: list[str] = []
+    fraud_kw_found: list[str] = []
+    combined_keywords = FRAUD_KEYWORDS + EMAIL_FRAUD_KEYWORDS
+
+    for entry in email_data:
+        raw = entry.get("mail", "")
+        is_relevant = (email_addr and email_addr in raw) or first_name in raw
+        if not is_relevant:
+            continue
+        raw_lower = raw.lower()
+
+        for frag in KNOWN_PHISHING_FRAGMENTS:
+            if frag in raw_lower:
+                phishing_hits += 1
+                suspicious_domains.append(frag)
+        for kw in combined_keywords:
+            if kw in raw_lower:
+                fraud_kw_found.append(kw)
+        has_fraud_kw = any(kw in raw_lower for kw in combined_keywords)
+        if has_fraud_kw:
+            for shortener in URL_SHORTENERS:
+                if shortener in raw_lower:
+                    phishing_hits += 1
+                    suspicious_domains.append(shortener)
+
+    return {
+        "phishing_hits": phishing_hits,
+        "suspicious_domains": list(set(suspicious_domains)),
+        "fraud_keywords": list(set(fraud_kw_found)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # ContextAgent
 # ---------------------------------------------------------------------------
@@ -223,11 +271,13 @@ class ContextAgent:
         users_path: str | Path = "data/users.json",
         locations_path: str | Path = "data/locations.json",
         sms_path: str | Path = "data/sms.json",
+        email_path: str | Path = "data/mails.json",
     ) -> None:
         self._transactions_path = Path(transactions_path)
         self._users_path = Path(users_path)
         self._locations_path = Path(locations_path)
         self._sms_path = Path(sms_path)
+        self._email_path = Path(email_path)
         self._load_all()
 
     def _load_all(self) -> None:
@@ -251,10 +301,15 @@ class ContextAgent:
             with open(self._sms_path) as f:
                 self._sms = json.load(f)
 
+        self._emails: list[dict] = []
+        if self._email_path.exists():
+            with open(self._email_path) as f:
+                self._emails = json.load(f)
+
         logger.info(
-            "ContextAgent loaded: %d txs | %d users | %d gps pings | %d sms",
+            "ContextAgent loaded: %d txs | %d users | %d gps pings | %d sms | %d emails",
             len(self._df), len(self._users_by_iban),
-            len(self._locations), len(self._sms),
+            len(self._locations), len(self._sms), len(self._emails),
         )
 
     def reload(
@@ -263,6 +318,7 @@ class ContextAgent:
         users_path: str | Path | None = None,
         locations_path: str | Path | None = None,
         sms_path: str | Path | None = None,
+        email_path: str | Path | None = None,
     ) -> None:
         """
         Hot-swap data sources — useful when validation data arrives mid-run.
@@ -276,6 +332,8 @@ class ContextAgent:
             self._locations_path = Path(locations_path)
         if sms_path:
             self._sms_path = Path(sms_path)
+        if email_path:
+            self._email_path = Path(email_path)
         self._load_all()
 
     # ── Team contract ─────────────────────────────────────────────────────
@@ -309,6 +367,7 @@ class ContextAgent:
             "recent_tx_summary": self._recent_summary(tx),
             "gps_location_match": self._gps_check(tx),
             "sms_fraud_signals": self._sms_signals(user),
+            "email_fraud_signals": self._email_signals(user),
             "amount_context": self._amount_context(tx, user),
             "risk_flags": [],
         }
@@ -418,6 +477,13 @@ class ContextAgent:
         phone = _extract_phone(first_name, self._sms)
         return _sms_fraud_signals(phone, first_name, self._sms)
 
+    def _email_signals(self, user: dict | None) -> dict:
+        if not user:
+            return {"phishing_hits": 0, "suspicious_domains": [], "fraud_keywords": []}
+        first_name = user.get("first_name", "")
+        email_addr = user.get("email", "")
+        return _email_fraud_signals(email_addr, first_name, self._emails)
+
     def _amount_context(self, tx: pd.Series, user: dict | None) -> dict:
         uid = tx["sender_id"]
         hist = self._df[
@@ -475,6 +541,21 @@ class ContextAgent:
         if sms["fraud_keywords"]:
             flags.append(
                 f"Fraud keywords in SMS: {', '.join(sms['fraud_keywords'][:4])}."
+            )
+
+        email = b.get("email_fraud_signals", {})
+        if email.get("phishing_hits", 0) > 0:
+            domains = ", ".join(email["suspicious_domains"][:3])
+            flags.append(
+                f"User's email history contains {email['phishing_hits']} phishing signal(s): {domains}."
+            )
+        if email.get("fraud_keywords"):
+            flags.append(
+                f"Fraud keywords in email: {', '.join(email['fraud_keywords'][:4])}."
+            )
+        if sms.get("fraud_keywords") and email.get("fraud_keywords"):
+            flags.append(
+                "Fraud keywords present in BOTH SMS and email — cross-channel social engineering indicator."
             )
 
         if b["recent_tx_summary"]["count"] == 0:

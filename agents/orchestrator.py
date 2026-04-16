@@ -162,6 +162,7 @@ class DecisionFusion:
         investigator,
         critic,
         memory=None,
+        stt_agent=None,
     ) -> dict:
         """
         Return a verdict dict: {fraud: bool, confidence: float, reason: str}
@@ -175,6 +176,18 @@ class DecisionFusion:
         # Gray zone → LLM path
         try:
             ctx = context_agent.build(tx_id)
+            # Enrich with STT audio signals (stopgap until Role B adds to Context.build)
+            if stt_agent is not None:
+                user_id = str(tx.get("sender_id", ""))
+                ctx["audio_fraud_signals"] = stt_agent.fraud_signals(user_id)
+
+            # Pre-filter: if Context found nothing suspicious, skip the LLM.
+            # No GPS mismatch, no phishing, no unusual amount, no new merchant
+            # → almost certainly legitimate despite the ambiguous IF score.
+            if not ctx.get("risk_flags"):
+                logger.debug("fusion | pre-filter skip (no flags) tx=%s score=%.3f", tx_id, score)
+                return {"fraud": False, "confidence": 1 - score, "reason": "pre_filter_no_signals"}
+
             verdict = investigator.judge(tx, ctx, memory_handle=memory)
 
             if self._use_critic and critic is not None:
@@ -186,9 +199,9 @@ class DecisionFusion:
                         critic_result.get("reason"),
                     )
                     verdict = {
-                        "fraud": False,
-                        "confidence": 0.5,
-                        "reason": f"critic_override: {critic_result.get('reason')}",
+                        "fraud": critic_result["final_verdict"] == "fraud",
+                        "confidence": critic_result["adjusted_confidence"],
+                        "reason": f"critic: {critic_result.get('reason')}",
                     }
 
             return verdict
@@ -226,6 +239,7 @@ class OrchestratorAgent:
         investigator,   # Role C — agents.investigator.InvestigatorAgent
         critic,         # Role C — agents.critic.CriticAgent (None for L1-3)
         memory,         # Role C — agents.memory.MemoryAgent
+        stt_agent=None, # Role C — agents.stt.STTAgent (L3+ only, optional)
     ) -> None:
         self.level = level
         cfg = LEVEL_CONFIG[level]
@@ -235,6 +249,7 @@ class OrchestratorAgent:
         self.investigator = investigator
         self.critic = critic
         self.memory = memory
+        self.stt_agent = stt_agent
 
         self.cost_tracker = CostTracker(
             level=level,
@@ -314,13 +329,14 @@ class OrchestratorAgent:
                 investigator=self.investigator,
                 critic=self.critic,
                 memory=self.memory,
+                stt_agent=self.stt_agent,
             )
 
             if verdict["fraud"]:
                 fraud_ids.append(tx_id)
 
             verdict_str = "fraud" if verdict.get("fraud") else "legit"
-            self.memory.update(tx, verdict_str)
+            self.memory.update(tx, verdict_str, confidence=verdict.get("confidence", 1.0))
 
         logger.info(
             "orchestrator | done fraud=%d cost=%s",
