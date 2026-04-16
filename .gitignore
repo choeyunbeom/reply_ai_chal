@@ -17,3 +17,4 @@ data/level_*/eval.csv
 *.joblib
 *.lgb
 /data
+/submissions
