@@ -665,11 +665,27 @@ class InvestigatorAgent:
         """
         Build the prompt for hypothesis + prediction generation.
 
+        Prompt structure incorporates three techniques from analytic philosophy
+        that measurably improve LLM reasoning on structured tasks:
+
+        1. EXPLICIT LOGICAL FORM — the modus tollens skeleton of falsification
+           is stated formally in the preamble. The model reasons within the
+           logical frame rather than defaulting to narrative association.
+
+        2. DE RE FRAMING — predictions are required to be about THIS SPECIFIC
+           transaction and its observable properties, not about the abstract
+           concept of "legitimate" or "fraudulent". This eliminates a class
+           of unfalsifiable definitional predictions.
+
+        3. OPERATOR PRECEDENCE — compound conditions must be explicitly
+           parenthesised. Prevents ambiguous parsing of multi-condition
+           predictions downstream.
+
         Deliberately prescriptive: the LLM must produce predictions that
         reference specific data fields, not narrative suspicion.
         """
         hypothesis_list = "\n".join(
-            f"  - {name} (prior={priors.get(name, 0.0):.2f})"
+            f"  - {name} (prior P(H) = {priors.get(name, 0.0):.2f})"
             for name in self.hypothesis_set
         )
 
@@ -681,32 +697,44 @@ class InvestigatorAgent:
             )
 
         context_summary = self._summarise_context_for_prompt(context)
+        tx_summary = self._summarise_tx_for_prompt(tx)
 
-        return f"""You are a fraud investigator using Popperian falsification.
-You do NOT look for evidence that CONFIRMS fraud. You test hypotheses by
-trying to REFUTE them. A hypothesis that survives refutation attempts is
-provisionally credible.
+        return f"""You are a fraud investigator reasoning under Popperian falsification.
 
-HYPOTHESES TO TEST:
+LOGICAL FORM:
+For each hypothesis H_i, generate predictions P_{{i,j}} such that if H_i is
+true, P_{{i,j}} must hold. P_{{i,j}} is FALSIFIED iff observed evidence E
+contradicts it. H_i is corroborated (never confirmed) iff its predictions
+survive falsification. You are refuting hypotheses, not confirming them.
+
+HYPOTHESES:
 {hypothesis_list}
 {memory_hints}
 
 TRANSACTION:
-{self._summarise_tx_for_prompt(tx)}
+{tx_summary}
 
-CONTEXT BUNDLE:
+CONTEXT:
 {context_summary}
 
-TASK: For each hypothesis, generate 2-3 predictions that would REFUTE it
-if true. Each prediction must:
-  - reference a SPECIFIC data field (amount, hour, gps, sms, merchant,
-    counterparty, etc.) or a COMPARATOR (greater than, less than, within,
-    outside, contains)
-  - be falsifiable: it must be possible to say "this prediction failed"
-    based on observed data
-  - avoid vague phrases like "something suspicious" or "might seem unusual"
+TASK: For each H_i, generate 2–3 predictions that would refute it.
 
-Return JSON in exactly this format:
+PREDICTION RULES:
+(a) DE RE: each prediction must be about THIS transaction's observable
+    properties, not about abstractions. Reference specific context fields
+    (amount, gps_location_match, sms_fraud_signals, hour, recipient_in_degree,
+    is_new_merchant, etc.) with specific comparators (>, <, within, contains).
+    GOOD: "GPS ping should be within 50km of transaction location."
+    BAD:  "A legitimate transaction would not look suspicious."
+
+(b) FALSIFIABLE: if you cannot state what observation would make the
+    prediction fail, do not include it.
+
+(c) PARENTHESISE compound conditions explicitly:
+    GOOD: "((GPS distance > 50km) AND (hour in [0,5])) OR (z-score > 3.0)"
+    BAD:  "GPS > 50km AND hour 0-5 OR z-score > 3"
+
+RETURN FORMAT — valid JSON only, no markdown:
 {{
   "legitimate transaction": [
     {{"prediction": "...", "refutation_target": "gps_location_match", "diagnostic_weight": 0.7}},
@@ -717,8 +745,8 @@ Return JSON in exactly this format:
   "synthetic identity fraud": [...],
   "unauthorised use of payment method": [...]
 }}
-
-Return ONLY valid JSON. No markdown, no preamble.
+diagnostic_weight ∈ [0,1]: higher = more diagnostic (unique to one hypothesis).
+Return ONLY the JSON object.
 """
 
     def _summarise_tx_for_prompt(self, tx: Any) -> str:
