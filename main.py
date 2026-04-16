@@ -12,10 +12,14 @@ Flags:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from config import LEVEL_CONFIG, DATA_DIR, SUBMISSIONS_DIR
 from agents.orchestrator import OrchestratorAgent, check_drift, time_split
@@ -35,9 +39,10 @@ logger = logging.getLogger(__name__)
 
 def load_data(level: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load train and eval CSVs for a level."""
+    cfg = LEVEL_CONFIG[level]
     level_dir = DATA_DIR / f"level_{level}"
-    train_path = level_dir / "train.csv"
-    eval_path = level_dir / "eval.csv"
+    train_path = level_dir / cfg["train_folder"] / "transactions.csv"
+    eval_path = level_dir / cfg["eval_folder"] / "transactions.csv"
 
     if not train_path.exists():
         logger.error("Missing: %s", train_path)
@@ -48,6 +53,13 @@ def load_data(level: int) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     train_df = pd.read_csv(train_path)
     eval_df = pd.read_csv(eval_path)
+
+    # Derive hour from timestamp (real dataset uses ISO timestamp, not a pre-split hour column)
+    for df in (train_df, eval_df):
+        if "timestamp" in df.columns and "hour" not in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["hour"] = df["timestamp"].dt.hour
+
     logger.info("Loaded level %d: train=%d eval=%d", level, len(train_df), len(eval_df))
     return train_df, eval_df
 
@@ -55,7 +67,7 @@ def load_data(level: int) -> tuple[pd.DataFrame, pd.DataFrame]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reply Mirror fraud pipeline")
     parser.add_argument("--level", type=int, required=True, choices=range(1, 6))
-    parser.add_argument("--train", action="store_true", help="Train scorer before running")
+    parser.add_argument("--train", action="store_true", help="(disabled: no labels in dataset)")
     parser.add_argument("--submit", action="store_true", help="Write submission file")
     args = parser.parse_args()
 
@@ -70,17 +82,43 @@ def main() -> None:
     if level > 1:
         prev_train_df, _ = load_data(level - 1)
         drift = check_drift(prev_train_df, train_df)
-        logger.info("Drift vs level %d: %s", level - 1, drift)
-        logger.info(">>> Pass drift summary above to Role B for feature tweaks <<<")
+        print("\n" + "=" * 60)
+        print(f"DRIFT SUMMARY (L{level-1} → L{level}) — share with Role B")
+        print("=" * 60)
+        for k, v in drift.items():
+            print(f"  {k}: {v}")
+        print("=" * 60 + "\n")
 
     # Time-based split for internal validation
     train_split, val_split = time_split(train_df)
 
     # Initialise agents
+    level_dir = DATA_DIR / f"level_{level}"
+    train_dir = level_dir / cfg["train_folder"]
+
+    # Langfuse tracing via environment variables (auto-picked up by SDK)
+    os.environ.setdefault("LANGFUSE_PUBLIC_KEY", os.environ["LANGFUSE_PUBLIC_KEY"])
+    os.environ.setdefault("LANGFUSE_SECRET_KEY", os.environ["LANGFUSE_SECRET_KEY"])
+    os.environ.setdefault("LANGFUSE_HOST", os.environ["LANGFUSE_HOST"])
+    logger.info("langfuse | tracing enabled → %s", os.environ["LANGFUSE_HOST"])
+
+    # LLM client via OpenRouter (Langfuse traces via env vars automatically)
+    from langfuse.openai import OpenAI as LangfuseOpenAI
+    llm_client = LangfuseOpenAI(
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        base_url="https://openrouter.ai/api/v1",
+    )
+
     memory = MemoryAgent()
-    scorer = ScorerAgent()
-    context_agent = ContextAgent()
-    investigator = InvestigatorAgent()
+    scorer = ScorerAgent(users_path=train_dir / "users.json")
+    context_agent = ContextAgent(
+        transactions_path=train_dir / "transactions.csv",
+        users_path=train_dir / "users.json",
+        locations_path=train_dir / "locations.json",
+        sms_path=train_dir / "sms.json",
+    )
+    investigator = InvestigatorAgent(llm_client=llm_client)
+    investigator._model = cfg["llm_model"]
     critic = CriticAgent() if cfg["critic"] else None
 
     orchestrator = OrchestratorAgent(
@@ -92,14 +130,43 @@ def main() -> None:
         memory=memory,
     )
 
-    # Optionally train scorer
+    # --train disabled: dataset has no fraud labels, heuristic scorer used instead
     if args.train:
-        logger.info("Training scorer on level %d train split (%d rows)…", level, len(train_split))
-        scorer.train(train_split)
+        logger.warning("--train ignored: no is_fraud labels in dataset, using heuristic scorer")
+
+    # Build user stats from train data so heuristic scorer has baselines
+    logger.info("scorer | building user stats from train data (%d rows)", len(train_df))
+    scorer._stats.build(train_df)
+    import json
+    with open(train_dir / "users.json") as f:
+        _users = json.load(f)
+    from agents.scorer import build_home_cities
+    scorer._home_cities = build_home_cities(train_df, _users)
+
+    # Step 4: cache training baseline for drift detection, load hypotheses
+    memory.cache_training_baseline(train_df)
+    if level >= 2:
+        memory.refresh_hypotheses(level)
+    logger.info("memory | baseline cached, hypotheses=%d", len(memory.hypotheses()))
+
+    # Reload context_agent with eval data so build(tx_id) works on eval set
+    eval_dir = level_dir / cfg["eval_folder"]
+    context_agent.reload(
+        transactions_path=eval_dir / "transactions.csv",
+        users_path=eval_dir / "users.json" if (eval_dir / "users.json").exists() else None,
+        locations_path=eval_dir / "locations.json" if (eval_dir / "locations.json").exists() else None,
+        sms_path=eval_dir / "sms.json" if (eval_dir / "sms.json").exists() else None,
+    )
+    logger.info("context | reloaded with eval data")
 
     # Run pipeline on eval set
     fraud_ids = orchestrator.run(eval_df)
     logger.info("Pipeline complete — %d fraud IDs flagged", len(fraud_ids))
+
+    # Step 9: record internal validation score for next level
+    # Role B should pass val_score after evaluating on val_split
+    # memory.record_level_score(level, val_score)
+    logger.info("memory | TODO: call memory.record_level_score(%d, val_score) after Role B eval", level)
 
     # Write submission
     if args.submit:

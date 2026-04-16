@@ -1,16 +1,10 @@
 """
 agents/orchestrator.py — Orchestrator + Decision Fusion (Role A).
 
-Routes each transaction through the pipeline:
-  score → [gray zone] → context → investigator → [critic] → decision fusion
+Pipeline flow:
+  score → DecisionFusion → [gray zone] → context → investigator → [critic] → final verdict
 
-Also owns:
-  - cost-aware gray zone narrowing when budget is throttled
-  - time-based train/eval split (last 20%)
-  - drift check vs prior level
-  - final submission assembly
-
-L1-3 ownership: Role A owns this file entirely.
+Role A owns this file entirely (L1-5).
 Do NOT modify without flagging Role A.
 """
 
@@ -20,27 +14,37 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import LEVEL_CONFIG, DATA_DIR, SUBMISSIONS_DIR
+from config import LEVEL_CONFIG, SUBMISSIONS_DIR
 from utils.cost_tracker import CostTracker, BudgetExhausted
 from utils.validator import validate, write_submission
-from agents.memory import MemoryAgent
 
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------ #
+# Helpers                                                             #
+# ------------------------------------------------------------------ #
+
 def check_drift(prev_tx: pd.DataFrame, curr_tx: pd.DataFrame) -> dict:
     """
     Compute distribution shift between two levels.
-    Pass the result to Role B for feature tweaks.
+    Pass the returned dict to Role B for feature tweaks before retraining.
+
+    Real dataset columns: timestamp, sender_id, recipient_id, amount,
+    transaction_type, payment_method, location, balance_after, description.
+    `hour` is derived in load_data() from timestamp.
     """
     hour_col = "hour" if "hour" in curr_tx.columns else None
     amount_col = "amount" if "amount" in curr_tx.columns else None
     loc_col = "location" if "location" in curr_tx.columns else None
+    # recipient_id is the real column; merchant_id kept as fallback for older data
     merchant_col = (
-        "merchant_id" if "merchant_id" in curr_tx.columns
-        else "recipient_id" if "recipient_id" in curr_tx.columns
+        "recipient_id" if "recipient_id" in curr_tx.columns
+        else "merchant_id" if "merchant_id" in curr_tx.columns
         else None
     )
+    tx_type_col = "transaction_type" if "transaction_type" in curr_tx.columns else None
+    pay_method_col = "payment_method" if "payment_method" in curr_tx.columns else None
 
     result: dict = {}
 
@@ -57,12 +61,20 @@ def check_drift(prev_tx: pd.DataFrame, curr_tx: pd.DataFrame) -> dict:
             set(curr_tx[loc_col].astype(str)) - set(prev_tx[loc_col].astype(str))
         )
     if merchant_col:
-        result["new_merchants"] = list(
+        result["new_recipients"] = list(
             set(curr_tx[merchant_col].astype(str))
             - set(prev_tx[merchant_col].astype(str))
         )
+    if tx_type_col:
+        result["new_transaction_types"] = list(
+            set(curr_tx[tx_type_col].astype(str)) - set(prev_tx[tx_type_col].astype(str))
+        )
+    if pay_method_col:
+        result["new_payment_methods"] = list(
+            set(curr_tx[pay_method_col].astype(str)) - set(prev_tx[pay_method_col].astype(str))
+        )
 
-    logger.info("orchestrator | drift check: %s", result)
+    logger.info("drift | %s", result)
     return result
 
 
@@ -71,23 +83,149 @@ def time_split(df: pd.DataFrame, holdout_frac: float = 0.20) -> tuple[pd.DataFra
     Time-based split: train = first 80%, val = last 20%.
     NEVER use random splits — they hide drift effects.
     """
-    n = len(df)
-    cutoff = int(n * (1 - holdout_frac))
+    cutoff = int(len(df) * (1 - holdout_frac))
     train = df.iloc[:cutoff].reset_index(drop=True)
     val = df.iloc[cutoff:].reset_index(drop=True)
-    logger.info("orchestrator | time_split: train=%d val=%d", len(train), len(val))
+    logger.info("time_split | train=%d val=%d", len(train), len(val))
     return train, val
 
 
+# ------------------------------------------------------------------ #
+# Decision Fusion                                                      #
+# ------------------------------------------------------------------ #
+
+class DecisionFusion:
+    """
+    Combines scorer output and LLM verdicts into a final fraud decision.
+
+    Routing logic:
+      score < gray_low  → legit  (no LLM call)
+      score > gray_high → fraud  (no LLM call)
+      else              → pass to investigator (and critic if enabled)
+
+    When budget is exhausted, falls back to scorer midpoint threshold.
+    When budget is throttled (≥90%), gray zone narrows by ±0.10.
+    When drift is detected, gray zone widens by ±(0.20 * drift_score).
+    Drift widening is applied before throttle narrowing.
+    """
+
+    THROTTLE_MARGIN = 0.10
+    DRIFT_MARGIN = 0.20
+
+    def __init__(
+        self,
+        gray_low: float,
+        gray_high: float,
+        use_critic: bool,
+        cost_tracker: CostTracker,
+    ) -> None:
+        self._gray_low = gray_low
+        self._gray_high = gray_high
+        self._use_critic = use_critic
+        self.cost_tracker = cost_tracker
+        self._drift_score: float = 0.0  # set via apply_drift()
+
+    def apply_drift(self, drift_score: float) -> None:
+        """
+        Called once per run() with memory.drift_signal()["drift_score"].
+        Widens gray zone proportionally to detected drift.
+        """
+        self._drift_score = float(np.clip(drift_score, 0.0, 1.0))
+        logger.info(
+            "fusion | drift_score=%.3f → gray zone base [%.2f, %.2f] → adjusted [%.2f, %.2f]",
+            self._drift_score,
+            self._gray_low, self._gray_high,
+            self._gray_low - self.DRIFT_MARGIN * self._drift_score,
+            self._gray_high + self.DRIFT_MARGIN * self._drift_score,
+        )
+
+    @property
+    def gray_low(self) -> float:
+        low = self._gray_low - self.DRIFT_MARGIN * self._drift_score
+        if self.cost_tracker.throttled:
+            low += self.THROTTLE_MARGIN
+        return float(np.clip(low, 0.0, 0.5))
+
+    @property
+    def gray_high(self) -> float:
+        high = self._gray_high + self.DRIFT_MARGIN * self._drift_score
+        if self.cost_tracker.throttled:
+            high -= self.THROTTLE_MARGIN
+        return float(np.clip(high, 0.5, 1.0))
+
+    def decide(
+        self,
+        tx: dict,
+        tx_id: str,
+        score: float,
+        context_agent,
+        investigator,
+        critic,
+        memory=None,
+    ) -> dict:
+        """
+        Return a verdict dict: {fraud: bool, confidence: float, reason: str}
+        """
+        if score < self.gray_low:
+            return {"fraud": False, "confidence": 1 - score, "reason": "below_gray_zone"}
+
+        if score > self.gray_high:
+            return {"fraud": True, "confidence": score, "reason": "above_gray_zone"}
+
+        # Gray zone → LLM path
+        try:
+            ctx = context_agent.build(tx_id)
+            verdict = investigator.judge(tx, ctx, memory_handle=memory)
+
+            if self._use_critic and critic is not None:
+                critic_result = critic.verify(verdict, ctx)
+                if not critic_result.get("agree"):
+                    logger.info(
+                        "fusion | critic disagreed tx=%s reason=%s",
+                        tx_id,
+                        critic_result.get("reason"),
+                    )
+                    verdict = {
+                        "fraud": False,
+                        "confidence": 0.5,
+                        "reason": f"critic_override: {critic_result.get('reason')}",
+                    }
+
+            return verdict
+
+        except BudgetExhausted:
+            logger.warning(
+                "fusion | budget exhausted, scorer fallback tx=%s score=%.3f",
+                tx_id, score,
+            )
+            midpoint = (self.gray_low + self.gray_high) / 2
+            return {
+                "fraud": score >= midpoint,
+                "confidence": score,
+                "reason": "budget_exhausted_fallback",
+            }
+
+
+# ------------------------------------------------------------------ #
+# Orchestrator                                                         #
+# ------------------------------------------------------------------ #
+
 class OrchestratorAgent:
+    """
+    Top-level pipeline coordinator (Role A).
+
+    Wires together: memory → scorer → decision fusion → submission.
+    Does NOT own Scorer, Context, Investigator, Memory, or Critic internals.
+    """
+
     def __init__(
         self,
         level: int,
         scorer,         # Role B — agents.scorer.ScorerAgent
         context_agent,  # Role B — agents.context.ContextAgent
         investigator,   # Role C — agents.investigator.InvestigatorAgent
-        critic,         # Role C — agents.critic.CriticAgent (may be None)
-        memory: MemoryAgent,
+        critic,         # Role C — agents.critic.CriticAgent (None for L1-3)
+        memory,         # Role C — agents.memory.MemoryAgent
     ) -> None:
         self.level = level
         cfg = LEVEL_CONFIG[level]
@@ -104,27 +242,21 @@ class OrchestratorAgent:
             throttle_at=cfg["throttle_at"],
         )
 
-        self._gray_low: float = cfg["gray_low"]
-        self._gray_high: float = cfg["gray_high"]
-        self._model: str = cfg["llm_model"]
-        self._use_critic: bool = cfg["critic"]
+        self.fusion = DecisionFusion(
+            gray_low=cfg["gray_low"],
+            gray_high=cfg["gray_high"],
+            use_critic=cfg["critic"],
+            cost_tracker=self.cost_tracker,
+        )
 
-    # ------------------------------------------------------------------ #
-    # Gray zone boundaries (throttle-aware)                               #
-    # ------------------------------------------------------------------ #
-
+    # Expose gray zone for tests / logging
     @property
     def gray_low(self) -> float:
-        if self.cost_tracker.throttled:
-            # Shrink gray zone when budget is tight → fewer LLM calls
-            return self._gray_low + 0.10
-        return self._gray_low
+        return self.fusion.gray_low
 
     @property
     def gray_high(self) -> float:
-        if self.cost_tracker.throttled:
-            return self._gray_high - 0.10
-        return self._gray_high
+        return self.fusion.gray_high
 
     # ------------------------------------------------------------------ #
     # Main pipeline                                                        #
@@ -132,97 +264,88 @@ class OrchestratorAgent:
 
     def run(self, eval_df: pd.DataFrame) -> list[str]:
         """
-        Process all transactions in eval_df and return a list of fraud IDs.
-
-        Parameters
-        ----------
-        eval_df:
-            Evaluation dataset for this level (no labels).
+        Run the full pipeline on eval_df. Returns list of fraud transaction IDs.
         """
         tx_id_col = "transaction_id"
-        logger.info(
-            "orchestrator | level=%d transactions=%d", self.level, len(eval_df)
-        )
+        logger.info("orchestrator | level=%d tx=%d", self.level, len(eval_df))
 
-        # Inject memory-derived features before scoring
-        memory_features = eval_df.apply(
-            lambda row: self.memory.query(row.to_dict()), axis=1
-        )
-        memory_df = pd.DataFrame(list(memory_features))
-        enriched_df = pd.concat(
-            [eval_df.reset_index(drop=True), memory_df], axis=1
-        )
+        # Drift-aware gray zone adjustment (Role C proposal, agreed L1+)
+        try:
+            drift = self.memory.drift_signal()
+            self.fusion.apply_drift(drift.get("drift_score", 0.0))
+        except NotImplementedError:
+            logger.debug("fusion | drift_signal() not implemented yet — skipping")
 
-        # Batch score all transactions
+        # Memory feature injection → enrich before batch scoring
+        # memory.query() returns patterns including "known_fraud_merchants" set.
+        # ScorerAgent.update_memory_features() handles injection into the DataFrame.
+        memory_patterns = self.memory.query({})  # batch-level patterns
+        # ScorerAgent.update_memory_features() expects "known_fraud_merchants" set;
+        # MemoryAgent exposes it via fraud_merchants.fraud_merchants (Role C internals).
+        # We extract it safely here to avoid coupling Scorer to Memory internals.
+        if hasattr(self.memory, "fraud_merchants"):
+            memory_patterns.setdefault(
+                "known_fraud_merchants",
+                self.memory.fraud_merchants.fraud_merchants,
+            )
+        if hasattr(self.scorer, "update_memory_features"):
+            enriched_df = self.scorer.update_memory_features(eval_df, memory_patterns)
+        else:
+            enriched_df = eval_df.copy()
+
         scores: np.ndarray = self.scorer.predict(enriched_df)
+
+        # Context-aware score boost: if context_agent has phishing signals for a tx,
+        # bump score into gray zone so LLM investigator handles it.
+        # This compensates for heuristic scorer being blind to SMS/email signals.
+        boosted_scores = scores.copy()
+        if hasattr(self.context_agent, "build"):
+            for idx, (_, row) in enumerate(eval_df.iterrows()):
+                try:
+                    ctx_quick = self.context_agent.build(str(row[tx_id_col]))
+                    sms = ctx_quick.get("sms_fraud_signals", {})
+                    phishing_hits = sms.get("phishing_hits", 0) or 0
+                    _fk = sms.get("fraud_keywords", 0)
+                    fraud_kw = len(_fk) if isinstance(_fk, list) else int(_fk)
+                    if phishing_hits > 0 or fraud_kw >= 2:
+                        # Push into gray zone minimum
+                        boosted_scores[idx] = max(
+                            boosted_scores[idx],
+                            self.fusion.gray_low + 0.01,
+                        )
+                except Exception:
+                    pass
+        scores = boosted_scores
 
         fraud_ids: list[str] = []
 
         for idx, (_, row) in enumerate(eval_df.iterrows()):
             tx_id = str(row[tx_id_col])
-            score = float(scores[idx])
             tx = row.to_dict()
+            score = float(scores[idx])
 
-            verdict = self._route(tx, tx_id, score)
+            verdict = self.fusion.decide(
+                tx=tx,
+                tx_id=tx_id,
+                score=score,
+                context_agent=self.context_agent,
+                investigator=self.investigator,
+                critic=self.critic,
+                memory=self.memory,
+            )
+
             if verdict["fraud"]:
                 fraud_ids.append(tx_id)
 
-            # Update memory with this decision
-            self.memory.update(tx, verdict)
+            verdict_str = "fraud" if verdict.get("fraud") else "legit"
+            self.memory.update(tx, verdict_str)
 
         logger.info(
-            "orchestrator | done — fraud_ids=%d  cost=%s",
+            "orchestrator | done fraud=%d cost=%s",
             len(fraud_ids),
             self.cost_tracker.summary(),
         )
         return fraud_ids
-
-    def _route(self, tx: dict, tx_id: str, score: float) -> dict:
-        """
-        Apply routing logic for a single transaction.
-        Returns a verdict dict: {fraud, confidence, reason}
-        """
-        if score < self.gray_low:
-            return {"fraud": False, "confidence": 1 - score, "reason": "below_gray_zone"}
-
-        if score > self.gray_high:
-            return {"fraud": True, "confidence": score, "reason": "above_gray_zone"}
-
-        # Gray zone — call LLM agents
-        try:
-            ctx = self.context_agent.build(tx_id)
-            verdict = self.investigator.judge(tx, ctx)
-
-            if self._use_critic and self.critic is not None:
-                critic_result = self.critic.verify(verdict, ctx)
-                if not critic_result.get("agree"):
-                    logger.info(
-                        "orchestrator | critic disagreed on tx=%s: %s",
-                        tx_id,
-                        critic_result.get("reason"),
-                    )
-                    # Critic overrides — flip to safe side (not fraud)
-                    verdict = {
-                        "fraud": False,
-                        "confidence": 0.5,
-                        "reason": f"critic_override: {critic_result.get('reason')}",
-                    }
-
-            return verdict
-
-        except BudgetExhausted:
-            logger.warning(
-                "orchestrator | budget exhausted, falling back to scorer for tx=%s score=%.3f",
-                tx_id,
-                score,
-            )
-            # Fallback: treat gray zone midpoint as threshold
-            fraud = score >= (self.gray_low + self.gray_high) / 2
-            return {
-                "fraud": fraud,
-                "confidence": score,
-                "reason": "budget_exhausted_fallback",
-            }
 
     # ------------------------------------------------------------------ #
     # Submission                                                           #
@@ -230,17 +353,10 @@ class OrchestratorAgent:
 
     def submit(self, fraud_ids: list[str], eval_df: pd.DataFrame) -> Path:
         """
-        Validate and write the submission file.
-        ALWAYS call this instead of writing directly.
+        Validate then write submission. ALWAYS use this — never write directly.
         """
         validate(fraud_ids, eval_df)
-
         output_path = SUBMISSIONS_DIR / f"level_{self.level}.txt"
         write_submission(fraud_ids, output_path)
-
-        logger.info(
-            "orchestrator | submission written → %s  (%d fraud IDs)",
-            output_path,
-            len(fraud_ids),
-        )
+        logger.info("orchestrator | submission → %s (%d IDs)", output_path, len(fraud_ids))
         return output_path
