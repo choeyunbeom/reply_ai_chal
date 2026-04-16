@@ -571,7 +571,8 @@ class MemoryAgent:
         memory.save('memory_level_1.pkl')
     """
 
-    def __init__(self, llm_client: Any = None, drift_window: int = 500):
+    def __init__(self, llm_client: Any = None, drift_window: int = 500,
+                 fraud_confidence_threshold: float = 0.7):
         self.fraud_merchants = FraudMerchantTracker()
         self.graph = AccountGraph()
         self.drift = DriftMonitor(window_size=drift_window)
@@ -580,21 +581,31 @@ class MemoryAgent:
         # Track confirmed fraud for hypothesis generation (cross-level memory)
         self._fraud_summary: list[dict] = []
         self._current_level: int = 0
+        self._fraud_confidence_threshold = fraud_confidence_threshold
 
     # -- update / query (hot path) ------------------------------------------
 
-    def update(self, tx: Any, verdict: str | None = None) -> None:
+    def update(self, tx: Any, verdict: str | None = None,
+               confidence: float = 1.0) -> None:
         """
         Called every transaction by the Orchestrator after decision is made.
 
-        verdict: 'fraud', 'legit', or None (e.g. for initial passes before
-        the pipeline has a verdict). All states update graph and drift;
-        only 'fraud' triggers merchant-tracker and fraud-summary updates.
+        verdict: 'fraud', 'legit', or None. All states update graph and drift.
+        confidence: Investigator's confidence in the verdict, in [0, 1].
+
+        Only high-confidence fraud verdicts (>= fraud_confidence_threshold)
+        are recorded in the merchant tracker and fraud summary. This prevents
+        low-confidence Investigator guesses from contaminating Memory and
+        cascading errors through the Scorer via the feedback loop:
+            Investigator verdict → Memory → Scorer features → future verdicts
+
+        Graph and drift updates are unconditional — they need every transaction
+        regardless of verdict confidence.
         """
         self.graph.update(tx, verdict)
         self.drift.update(tx)
 
-        if verdict == "fraud":
+        if verdict == "fraud" and confidence >= self._fraud_confidence_threshold:
             self.fraud_merchants.record_fraud(tx)
             self._fraud_summary.append(self._summarise_fraud(tx))
 
@@ -603,7 +614,8 @@ class MemoryAgent:
         Per-transaction feature lookup for Scorer and Investigator.
 
         Returns:
-            is_known_fraud_merchant: bool
+            is_known_fraud_merchant: bool  (per-transaction, for Investigator)
+            known_fraud_merchants:   set   (raw set, for Scorer.update_memory_features)
             is_new_counterparty:     bool
             recipient_in_degree:     int
             sender_out_degree:       int
@@ -612,7 +624,18 @@ class MemoryAgent:
         """
         out = self.graph.query(tx)
         out["is_known_fraud_merchant"] = self.fraud_merchants.is_known_fraud_merchant(tx)
+        # Also expose the raw set — Scorer.update_memory_features() consumes this
+        out["known_fraud_merchants"] = set(self.fraud_merchants.fraud_merchants)
         return out
+
+    def known_fraud_merchants(self) -> set[str]:
+        """
+        Raw set of merchants seen in confirmed fraud.
+
+        Dedicated accessor for Scorer.update_memory_features(), which applies
+        the set across a batch of transactions rather than per-tx.
+        """
+        return set(self.fraud_merchants.fraud_merchants)
 
     # -- drift / hypotheses (warm path) -------------------------------------
 
