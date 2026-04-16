@@ -70,8 +70,12 @@ def main() -> None:
     if level > 1:
         prev_train_df, _ = load_data(level - 1)
         drift = check_drift(prev_train_df, train_df)
-        logger.info("Drift vs level %d: %s", level - 1, drift)
-        logger.info(">>> Pass drift summary above to Role B for feature tweaks <<<")
+        print("\n" + "=" * 60)
+        print(f"DRIFT SUMMARY (L{level-1} → L{level}) — share with Role B")
+        print("=" * 60)
+        for k, v in drift.items():
+            print(f"  {k}: {v}")
+        print("=" * 60 + "\n")
 
     # Time-based split for internal validation
     train_split, val_split = time_split(train_df)
