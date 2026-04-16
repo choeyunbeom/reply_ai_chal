@@ -41,7 +41,7 @@ class MockInvestigator:
     def __init__(self, verdict):
         self._verdict = verdict
 
-    def judge(self, tx, context):
+    def judge(self, tx, context, memory_handle=None):
         return self._verdict
 
 
@@ -55,6 +55,9 @@ class MockMemory:
             "hour_fraud_count": 0,
             "amount_in_fraud_range": False,
         }
+
+    def drift_signal(self):
+        return {"drift_score": 0.0}
 
 
 # ------------------------------------------------------------------ #
@@ -89,15 +92,15 @@ def test_check_drift_keys():
     assert "hour_shift" in result
     assert "amount_shift" in result
     assert "new_locations" in result
-    assert "new_merchants" in result
+    assert "new_recipients" in result
 
 
-def test_check_drift_detects_new_merchants():
-    prev = pd.DataFrame({"merchant_id": ["m_1", "m_2"], "amount": [100, 200], "hour": [1, 2], "location": ["Seoul", "Busan"]})
-    curr = pd.DataFrame({"merchant_id": ["m_2", "m_99"], "amount": [150, 250], "hour": [2, 3], "location": ["Seoul", "Jeju"]})
+def test_check_drift_detects_new_recipients():
+    prev = pd.DataFrame({"recipient_id": ["m_1", "m_2"], "amount": [100, 200], "hour": [1, 2], "location": ["Seoul", "Busan"]})
+    curr = pd.DataFrame({"recipient_id": ["m_2", "m_99"], "amount": [150, 250], "hour": [2, 3], "location": ["Seoul", "Jeju"]})
     result = check_drift(prev, curr)
-    assert "m_99" in result["new_merchants"]
-    assert "m_1" not in result["new_merchants"]
+    assert "m_99" in result["new_recipients"]
+    assert "m_1" not in result["new_recipients"]
 
 
 # ------------------------------------------------------------------ #

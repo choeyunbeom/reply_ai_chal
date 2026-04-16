@@ -29,15 +29,22 @@ def check_drift(prev_tx: pd.DataFrame, curr_tx: pd.DataFrame) -> dict:
     """
     Compute distribution shift between two levels.
     Pass the returned dict to Role B for feature tweaks before retraining.
+
+    Real dataset columns: timestamp, sender_id, recipient_id, amount,
+    transaction_type, payment_method, location, balance_after, description.
+    `hour` is derived in load_data() from timestamp.
     """
     hour_col = "hour" if "hour" in curr_tx.columns else None
     amount_col = "amount" if "amount" in curr_tx.columns else None
     loc_col = "location" if "location" in curr_tx.columns else None
+    # recipient_id is the real column; merchant_id kept as fallback for older data
     merchant_col = (
-        "merchant_id" if "merchant_id" in curr_tx.columns
-        else "recipient_id" if "recipient_id" in curr_tx.columns
+        "recipient_id" if "recipient_id" in curr_tx.columns
+        else "merchant_id" if "merchant_id" in curr_tx.columns
         else None
     )
+    tx_type_col = "transaction_type" if "transaction_type" in curr_tx.columns else None
+    pay_method_col = "payment_method" if "payment_method" in curr_tx.columns else None
 
     result: dict = {}
 
@@ -54,9 +61,17 @@ def check_drift(prev_tx: pd.DataFrame, curr_tx: pd.DataFrame) -> dict:
             set(curr_tx[loc_col].astype(str)) - set(prev_tx[loc_col].astype(str))
         )
     if merchant_col:
-        result["new_merchants"] = list(
+        result["new_recipients"] = list(
             set(curr_tx[merchant_col].astype(str))
             - set(prev_tx[merchant_col].astype(str))
+        )
+    if tx_type_col:
+        result["new_transaction_types"] = list(
+            set(curr_tx[tx_type_col].astype(str)) - set(prev_tx[tx_type_col].astype(str))
+        )
+    if pay_method_col:
+        result["new_payment_methods"] = list(
+            set(curr_tx[pay_method_col].astype(str)) - set(prev_tx[pay_method_col].astype(str))
         )
 
     logger.info("drift | %s", result)
@@ -90,9 +105,12 @@ class DecisionFusion:
 
     When budget is exhausted, falls back to scorer midpoint threshold.
     When budget is throttled (≥90%), gray zone narrows by ±0.10.
+    When drift is detected, gray zone widens by ±(0.20 * drift_score).
+    Drift widening is applied before throttle narrowing.
     """
 
     THROTTLE_MARGIN = 0.10
+    DRIFT_MARGIN = 0.20
 
     def __init__(
         self,
@@ -105,18 +123,35 @@ class DecisionFusion:
         self._gray_high = gray_high
         self._use_critic = use_critic
         self.cost_tracker = cost_tracker
+        self._drift_score: float = 0.0  # set via apply_drift()
+
+    def apply_drift(self, drift_score: float) -> None:
+        """
+        Called once per run() with memory.drift_signal()["drift_score"].
+        Widens gray zone proportionally to detected drift.
+        """
+        self._drift_score = float(np.clip(drift_score, 0.0, 1.0))
+        logger.info(
+            "fusion | drift_score=%.3f → gray zone base [%.2f, %.2f] → adjusted [%.2f, %.2f]",
+            self._drift_score,
+            self._gray_low, self._gray_high,
+            self._gray_low - self.DRIFT_MARGIN * self._drift_score,
+            self._gray_high + self.DRIFT_MARGIN * self._drift_score,
+        )
 
     @property
     def gray_low(self) -> float:
+        low = self._gray_low - self.DRIFT_MARGIN * self._drift_score
         if self.cost_tracker.throttled:
-            return self._gray_low + self.THROTTLE_MARGIN
-        return self._gray_low
+            low += self.THROTTLE_MARGIN
+        return float(np.clip(low, 0.0, 0.5))
 
     @property
     def gray_high(self) -> float:
+        high = self._gray_high + self.DRIFT_MARGIN * self._drift_score
         if self.cost_tracker.throttled:
-            return self._gray_high - self.THROTTLE_MARGIN
-        return self._gray_high
+            high -= self.THROTTLE_MARGIN
+        return float(np.clip(high, 0.5, 1.0))
 
     def decide(
         self,
@@ -126,6 +161,7 @@ class DecisionFusion:
         context_agent,
         investigator,
         critic,
+        memory=None,
     ) -> dict:
         """
         Return a verdict dict: {fraud: bool, confidence: float, reason: str}
@@ -139,7 +175,7 @@ class DecisionFusion:
         # Gray zone → LLM path
         try:
             ctx = context_agent.build(tx_id)
-            verdict = investigator.judge(tx, ctx)
+            verdict = investigator.judge(tx, ctx, memory_handle=memory)
 
             if self._use_critic and critic is not None:
                 critic_result = critic.verify(verdict, ctx)
@@ -233,16 +269,53 @@ class OrchestratorAgent:
         tx_id_col = "transaction_id"
         logger.info("orchestrator | level=%d tx=%d", self.level, len(eval_df))
 
+        # Drift-aware gray zone adjustment (Role C proposal, agreed L1+)
+        try:
+            drift = self.memory.drift_signal()
+            self.fusion.apply_drift(drift.get("drift_score", 0.0))
+        except NotImplementedError:
+            logger.debug("fusion | drift_signal() not implemented yet — skipping")
+
         # Memory feature injection → enrich before batch scoring
-        memory_features = eval_df.apply(
-            lambda row: self.memory.query(row.to_dict()), axis=1
-        )
-        enriched_df = pd.concat(
-            [eval_df.reset_index(drop=True), pd.DataFrame(list(memory_features))],
-            axis=1,
-        )
+        # memory.query() returns patterns including "known_fraud_merchants" set.
+        # ScorerAgent.update_memory_features() handles injection into the DataFrame.
+        memory_patterns = self.memory.query({})  # batch-level patterns
+        # ScorerAgent.update_memory_features() expects "known_fraud_merchants" set;
+        # MemoryAgent exposes it via fraud_merchants.fraud_merchants (Role C internals).
+        # We extract it safely here to avoid coupling Scorer to Memory internals.
+        if hasattr(self.memory, "fraud_merchants"):
+            memory_patterns.setdefault(
+                "known_fraud_merchants",
+                self.memory.fraud_merchants.fraud_merchants,
+            )
+        if hasattr(self.scorer, "update_memory_features"):
+            enriched_df = self.scorer.update_memory_features(eval_df, memory_patterns)
+        else:
+            enriched_df = eval_df.copy()
 
         scores: np.ndarray = self.scorer.predict(enriched_df)
+
+        # Context-aware score boost: if context_agent has phishing signals for a tx,
+        # bump score into gray zone so LLM investigator handles it.
+        # This compensates for heuristic scorer being blind to SMS/email signals.
+        boosted_scores = scores.copy()
+        if hasattr(self.context_agent, "build"):
+            for idx, (_, row) in enumerate(eval_df.iterrows()):
+                try:
+                    ctx_quick = self.context_agent.build(str(row[tx_id_col]))
+                    sms = ctx_quick.get("sms_fraud_signals", {})
+                    phishing_hits = sms.get("phishing_hits", 0) or 0
+                    _fk = sms.get("fraud_keywords", 0)
+                    fraud_kw = len(_fk) if isinstance(_fk, list) else int(_fk)
+                    if phishing_hits > 0 or fraud_kw >= 2:
+                        # Push into gray zone minimum
+                        boosted_scores[idx] = max(
+                            boosted_scores[idx],
+                            self.fusion.gray_low + 0.01,
+                        )
+                except Exception:
+                    pass
+        scores = boosted_scores
 
         fraud_ids: list[str] = []
 
@@ -258,12 +331,14 @@ class OrchestratorAgent:
                 context_agent=self.context_agent,
                 investigator=self.investigator,
                 critic=self.critic,
+                memory=self.memory,
             )
 
             if verdict["fraud"]:
                 fraud_ids.append(tx_id)
 
-            self.memory.update(tx, verdict)
+            verdict_str = "fraud" if verdict.get("fraud") else "legit"
+            self.memory.update(tx, verdict_str)
 
         logger.info(
             "orchestrator | done fraud=%d cost=%s",
