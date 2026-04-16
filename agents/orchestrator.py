@@ -1,14 +1,17 @@
 """
-agents/orchestrator.py — Orchestrator Agent (Role A).
+agents/orchestrator.py — Orchestrator + Decision Fusion (Role A).
 
 Routes each transaction through the pipeline:
-  score → [gray zone] → context → investigator → [critic] → decision
+  score → [gray zone] → context → investigator → [critic] → decision fusion
 
 Also owns:
   - cost-aware gray zone narrowing when budget is throttled
   - time-based train/eval split (last 20%)
   - drift check vs prior level
   - final submission assembly
+
+L1-3 ownership: Role A owns this file entirely.
+Do NOT modify without flagging Role A.
 """
 
 import logging

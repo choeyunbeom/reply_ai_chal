@@ -10,12 +10,19 @@ The system must be **agent-based** (deterministic-only approaches are penalized)
 
 ## My role (the operator working with you)
 
-I own **Role A — Pipeline & Orchestration**. My agents are the **Orchestrator** and the **Memory Agent**. My teammates own:
+I own **Role A — Pipeline & Orchestration**. My components are the **Orchestrator** and **Decision Fusion**. My teammates own:
 
 - **Role B** — Scorer (LightGBM) and Context agents
-- **Role C** — Investigator (LLM) and Critic (L4-L5 only) agents
+- **Role C** — Investigator (LLM), Memory agent, and Critic (L4-L5 only)
 
-When I ask you to work on Scorer/Context/Investigator/Critic internals, **stop and confirm** — those are owned by B and C. You can edit interfaces, stubs, and integration glue freely.
+**L1-3 ownership split:**
+| Component | Owner |
+|-----------|-------|
+| Orchestrator + Decision Fusion | Role A |
+| Scorer + Context | Role B |
+| Investigator + Memory | Role C |
+
+When I ask you to work on Scorer/Context/Investigator/Memory/Critic internals, **stop and confirm** — those are owned by B or C. You can edit interfaces, stubs, and integration glue freely.
 
 ## Architecture
 
@@ -80,12 +87,12 @@ reply-mirror/
 ├── main.py                  # entry: python main.py --level N
 ├── config.py                # LEVEL_CONFIG table
 ├── agents/
-│   ├── orchestrator.py      # Role A
-│   ├── memory.py            # Role A
-│   ├── scorer.py            # Role B
-│   ├── context.py           # Role B
-│   ├── investigator.py      # Role C
-│   └── critic.py            # Role C
+│   ├── orchestrator.py      # Role A — Orchestrator + Decision Fusion
+│   ├── scorer.py            # Role B — LightGBM scorer
+│   ├── context.py           # Role B — evidence builder
+│   ├── investigator.py      # Role C — LLM gray-zone judge
+│   ├── memory.py            # Role C — cross-level pattern store
+│   └── critic.py            # Role C — L4-L5 only
 ├── utils/
 │   ├── cost_tracker.py      # Role A — critical
 │   └── validator.py         # Role A — critical
@@ -185,8 +192,9 @@ Keep `requirements.txt` minimal — reviewers reproduce our runs.
 
 ## What to do when I ask for help
 
-- **Default to editing Role A code** (Orchestrator, Memory, utils)
-- **For Role B or C internals**, propose the change but flag ownership before committing
+- **Default to editing Role A code** (Orchestrator, Decision Fusion, utils)
+- **For Role B internals** (Scorer, Context), propose the change but flag ownership before committing
+- **For Role C internals** (Investigator, Memory, Critic), propose the change but flag ownership before committing
 - **For interface changes**, draft both sides (caller + callee) and highlight the diff so I can circulate to the team
 - **Never relax submission guards** (validator, cost tracker, 15% floor logic) without explicit instruction
 - **Time pressure is real** — prefer minimal working changes over refactors during the competition
