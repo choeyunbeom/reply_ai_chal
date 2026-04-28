@@ -2,6 +2,8 @@
 
 **Reply Challenge 2026** · **134th out of 1,971 teams** (top 6.8%)
 
+📝 **Blog Post:** [Reply Mirror AI Challenge 2026: Multi-Agent Fraud Detection](https://choeyunbeom.github.io/machine%20learning/competition/reply-mirror-ai-challenge-2026/)
+
 ---
 
 ## Overview
